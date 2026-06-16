@@ -5,7 +5,7 @@ import { DndContext, closestCenter, KeyboardSensor, PointerSensor, useSensor, us
 import { arrayMove, SortableContext, sortableKeyboardCoordinates, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { restrictToVerticalAxis, restrictToParentElement } from "@dnd-kit/modifiers";
-import { Card, Button, Modal, Input, CardSkeleton, ModelSelectModal, Toggle, ConfirmModal, CapacityBadges } from "@/shared/components";
+import { Card, Button, Modal, Input, Select, CardSkeleton, ModelSelectModal, Toggle, ConfirmModal, CapacityBadges } from "@/shared/components";
 import { useCopyToClipboard } from "@/shared/hooks/useCopyToClipboard";
 import { isOpenAICompatibleProvider, isAnthropicCompatibleProvider } from "@/shared/constants/providers";
 
@@ -39,8 +39,8 @@ export default function CombosPage() {
       const providersData = await providersRes.json();
       const settingsData = settingsRes.ok ? await settingsRes.json() : {};
       
-      // Only LLM combos here - webSearch/webFetch combos belong to media-providers/web
-      if (combosRes.ok) setCombos((combosData.combos || []).filter(c => !c.kind || c.kind === "llm"));
+      // Only LLM/fusion combos here - webSearch/webFetch combos belong to media-providers/web
+      if (combosRes.ok) setCombos((combosData.combos || []).filter(c => !c.kind || c.kind === "llm" || c.kind === "fusion"));
       if (providersRes.ok) {
         setActiveProviders(providersData.connections || []);
       }
@@ -233,7 +233,12 @@ function ComboCard({ combo, modelCaps = {}, copied, onCopy, onEdit, onDelete, ro
             <span className="material-symbols-outlined text-primary text-[18px]">layers</span>
           </div>
           <div className="min-w-0 flex-1">
-            <code className="block truncate font-mono text-sm font-medium">{combo.name}</code>
+            <div className="flex items-center gap-2">
+              <code className="block truncate font-mono text-sm font-medium">{combo.name}</code>
+              {combo.kind === "fusion" && (
+                <span className="shrink-0 rounded-full bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium text-primary">Fusion</span>
+              )}
+            </div>
             <div className="mt-1 flex min-w-0 flex-wrap items-center gap-1">
               {combo.models.length === 0 ? (
                 <span className="text-xs text-text-muted italic">No models</span>
@@ -396,11 +401,23 @@ function ModelItem({ id, index, model, isFirst, isLast, onEdit, onMoveUp, onMove
   );
 }
 
+const KIND_OPTIONS = [
+  { value: "llm", label: "Fallback (LLM)" },
+  { value: "fusion", label: "Fusion" },
+];
+
 function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, kindFilter = null }) {
   // Initialize state with combo values - key prop on parent handles reset on remount
   const [name, setName] = useState(combo?.name || "");
   const [models, setModels] = useState(combo?.models || []);
+  // kind: treat null/"llm" both as "llm" in the selector
+  const [kind, setKind] = useState(combo?.kind === "fusion" ? "fusion" : "llm");
+  // fusion config fields
+  const [judgeModel, setJudgeModel] = useState(combo?.config?.judgeModel || "");
+  const [judgePrompt, setJudgePrompt] = useState(combo?.config?.judgePrompt || "");
+  const [showProvenanceFooter, setShowProvenanceFooter] = useState(combo?.config?.showProvenanceFooter ?? false);
   const [showModelSelect, setShowModelSelect] = useState(false);
+  const [showJudgeModelSelect, setShowJudgeModelSelect] = useState(false);
   const [saving, setSaving] = useState(false);
   const [nameError, setNameError] = useState("");
   const [modelAliases, setModelAliases] = useState({});
@@ -490,7 +507,20 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, kindF
   const handleSave = async () => {
     if (!validateName(name)) return;
     setSaving(true);
-    await onSave({ name: name.trim(), models });
+    let payload = { name: name.trim(), models, kind };
+    if (kind === "fusion") {
+      const resolvedJudgeModel = judgeModel || models[0] || "";
+      const config = {
+        judgeModel: resolvedJudgeModel,
+        showProvenanceFooter,
+      };
+      const trimmedPrompt = judgePrompt.trim();
+      if (trimmedPrompt) config.judgePrompt = trimmedPrompt;
+      payload.config = config;
+    } else {
+      payload.config = null;
+    }
+    await onSave(payload);
     setSaving(false);
   };
 
@@ -517,6 +547,87 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, kindF
               Only letters, numbers, -, _ and . allowed
             </p>
           </div>
+
+          {/* Kind */}
+          <Select
+            label="Kind"
+            value={kind}
+            onChange={(e) => setKind(e.target.value)}
+            options={KIND_OPTIONS}
+          />
+
+          {/* Fusion config - shown only when kind === fusion */}
+          {kind === "fusion" && (
+            <div className="flex flex-col gap-3 rounded-lg border border-black/10 dark:border-white/10 bg-black/[0.01] dark:bg-white/[0.01] p-3">
+              <p className="text-xs font-medium text-text-muted uppercase tracking-wide">Fusion Settings</p>
+
+              {/* Judge model */}
+              <div>
+                <label className="text-sm font-medium mb-1.5 block">
+                  Judge model
+                  <span className="ml-1 font-normal text-text-muted">- synthesizes the final answer</span>
+                </label>
+                {judgeModel ? (
+                  <div className="flex items-center gap-2">
+                    <code className="flex-1 truncate rounded bg-black/5 dark:bg-white/5 px-2 py-1.5 font-mono text-xs text-text-main">{judgeModel}</code>
+                    <button
+                      type="button"
+                      onClick={() => setShowJudgeModelSelect(true)}
+                      className="shrink-0 text-xs text-primary font-medium hover:underline"
+                    >
+                      Change
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setJudgeModel("")}
+                      className="shrink-0 p-0.5 rounded hover:bg-red-500/10 text-text-muted hover:text-red-500"
+                      title="Clear - will default to first proposer model"
+                    >
+                      <span className="material-symbols-outlined text-[14px]">close</span>
+                    </button>
+                  </div>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => setShowJudgeModelSelect(true)}
+                    className="w-full py-2 border border-dashed border-black/10 dark:border-white/10 rounded-lg text-xs text-primary font-medium hover:border-primary/50 transition-colors flex items-center justify-center gap-1"
+                  >
+                    <span className="material-symbols-outlined text-[16px]">add</span>
+                    Pick judge model
+                    <span className="text-text-muted font-normal">(defaults to first proposer model)</span>
+                  </button>
+                )}
+              </div>
+
+              {/* Judge prompt */}
+              <div>
+                <label className="text-sm font-medium mb-1.5 block">Judge prompt <span className="font-normal text-text-muted">(optional)</span></label>
+                <textarea
+                  value={judgePrompt}
+                  onChange={(e) => setJudgePrompt(e.target.value)}
+                  rows={3}
+                  placeholder="Optional. Leave blank to use the built-in default synthesis prompt."
+                  className="w-full rounded-[10px] border border-transparent bg-surface-2 px-3 py-2.5 text-sm text-text-main placeholder-text-muted/70 focus:outline-none focus:ring-2 focus:ring-brand-500/30 focus:border-brand-500/40 transition-all duration-150 resize-y"
+                />
+                <p className="text-[10px] text-text-muted mt-0.5">
+                  Optional. A sensible default is used when left blank.
+                </p>
+              </div>
+
+              {/* Show provenance footer */}
+              <div className="flex items-start gap-3">
+                <Toggle
+                  checked={showProvenanceFooter}
+                  onChange={setShowProvenanceFooter}
+                  size="sm"
+                />
+                <div className="flex flex-col">
+                  <span className="text-sm font-medium text-text-main">Show provenance footer</span>
+                  <span className="text-xs text-text-muted">Append a summary of which models ran + confidence to the answer.</span>
+                </div>
+              </div>
+            </div>
+          )}
 
           {/* Models */}
           <div>
@@ -581,7 +692,7 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, kindF
         </div>
       </Modal>
 
-      {/* Model Select Modal */}
+      {/* Model Select Modal - proposer models */}
       <ModelSelectModal
         isOpen={showModelSelect}
         onClose={() => setShowModelSelect(false)}
@@ -593,6 +704,20 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, kindF
         kindFilter={kindFilter}
         addedModelValues={models}
         closeOnSelect={false}
+      />
+
+      {/* Judge Model Select Modal - for fusion kind */}
+      <ModelSelectModal
+        isOpen={showJudgeModelSelect}
+        onClose={() => setShowJudgeModelSelect(false)}
+        onSelect={(model) => { setJudgeModel(model.value); setShowJudgeModelSelect(false); }}
+        onDeselect={() => {}}
+        activeProviders={activeProviders}
+        modelAliases={modelAliases}
+        title="Pick Judge Model"
+        kindFilter={kindFilter}
+        addedModelValues={judgeModel ? [judgeModel] : []}
+        closeOnSelect={true}
       />
     </>
   );
