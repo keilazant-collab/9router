@@ -239,6 +239,17 @@ flowchart TD
 
 Fallback decisions are driven by `open-sse/services/accountFallback.js` using status codes and error-message heuristics.
 
+## Fusion Combos
+
+A combo may set `kind: "fusion"` to switch from sequential fallback to parallel multi-model synthesis. Instead of trying models one at a time, a fusion combo queries all of its `models` in parallel and reconciles their answers into one.
+
+- Invoked transparently: set a fusion combo's name as the `model` on `/v1` (same as any combo). Works in every supported CLI tool with no client changes.
+- Orchestrator: `open-sse/services/fusion.js` (`handleFusionChat`). `src/sse/handlers/chat.js` branches to it when the resolved combo has `kind === "fusion"` and at least 2 models; otherwise the normal `handleComboChat` path runs.
+- Flow: call all proposer models in parallel (buffered, `stream:false`) via the same `handleSingleModel` used by combos; build a judge prompt from the successful answers; call a judge model (`config.judgeModel`, default first model) and relay its response to the client (streamed when the client requested streaming).
+- Partial failure: if one proposer survives, its answer is returned directly (no judge call); if all fail, a 503 is returned; if the judge call fails, the first surviving proposer answer is returned.
+- Config (stored in the `combos.config` JSON column): `judgeModel`, optional `judgePrompt` (a sensible default ships built-in), and `showProvenanceFooter` (appends a per-model summary + coarse confidence to non-streaming answers; off by default).
+- Per-model status, latency, and cost are logged to request detail. Pure helpers in `fusion.js` (prompt builder, answer extraction, usage aggregation, outcome decision, footer) are unit-tested under `tests/unit/fusion-*.test.js`.
+
 ## OAuth Onboarding and Token Refresh Lifecycle
 
 ```mermaid
@@ -354,7 +365,9 @@ erDiagram
     COMBO {
       string id
       string name
+      string kind
       string[] models
+      json config
     }
 
     API_KEY {
