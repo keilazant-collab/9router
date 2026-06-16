@@ -63,3 +63,14 @@ export function aggregateUsage(entries) {
   }
   return { totalLatencyMs, totalCostUsd, okCount, failCount, perModel: list };
 }
+
+/**
+ * @param {{ok:boolean, model?:string, text?:string}[]} results
+ * @returns {{path:"all_failed"}|{path:"single_passthrough",winner:object}|{path:"synthesize",survivors:object[]}}
+ */
+export function decideFusionOutcome(results) {
+  const survivors = (Array.isArray(results) ? results : []).filter((r) => r && r.ok);
+  if (survivors.length === 0) return { path: "all_failed" };
+  if (survivors.length === 1) return { path: "single_passthrough", winner: survivors[0] };
+  return { path: "synthesize", survivors };
+}
