@@ -4,6 +4,8 @@
  * orchestrator handleFusionChat (added later) wires them to the request path.
  */
 
+import { unavailableResponse } from "../utils/error.js";
+
 export const DEFAULT_JUDGE_INSTRUCTION =
   "You are a synthesis judge. Below is a user prompt and several independent " +
   "answers from different AI models. Identify where the answers agree, where " +
@@ -97,4 +99,115 @@ export function formatProvenanceFooter({ perModel, judgeModel, degraded }) {
     `Fusion: ${okCount}/${perModel.length} models, judge ${judgeModel}, confidence ${confidence}${status}`,
     ...lines,
   ].join("\n");
+}
+
+const USER_PROMPT_FALLBACK = "(see conversation)";
+
+// Extract the latest user text from a request body across known shapes.
+function latestUserText(body) {
+  const pick = (arr) => {
+    if (!Array.isArray(arr)) return null;
+    for (let i = arr.length - 1; i >= 0; i--) {
+      const m = arr[i];
+      if (!m?.role || m.role === "user") return m;
+    }
+    return arr[arr.length - 1];
+  };
+  const m = pick(body?.messages) || pick(body?.input);
+  if (!m) return USER_PROMPT_FALLBACK;
+  if (typeof m.content === "string") return m.content;
+  if (Array.isArray(m.content)) {
+    return m.content.map((b) => (typeof b === "string" ? b : b?.text || "")).join(" ").trim() || USER_PROMPT_FALLBACK;
+  }
+  return USER_PROMPT_FALLBACK;
+}
+
+/**
+ * @param {object} args
+ * @param {object} args.body - original request body (client format)
+ * @param {string[]} args.models - proposer models
+ * @param {object} args.config - fusion config { judgeModel?, judgePrompt?, showProvenanceFooter? }
+ * @param {(body:object, model:string)=>Promise<Response>} args.handleSingleModel
+ * @param {object} args.log
+ */
+export async function handleFusionChat({ body, models, config = {}, handleSingleModel, log }) {
+  const wantStream = body?.stream === true;
+  const judgeModel = config.judgeModel || models[0];
+
+  // 1. Run proposers in parallel, buffered (stream:false).
+  const proposerBody = { ...body, stream: false };
+  const settled = await Promise.allSettled(
+    models.map(async (model) => {
+      const started = Date.now();
+      const res = await handleSingleModel(proposerBody, model);
+      const latencyMs = Date.now() - started;
+      if (!res.ok) return { model, ok: false, latencyMs, status: res.status };
+      const json = await res.clone().json().catch(() => null);
+      return { model, ok: true, latencyMs, text: extractAssistantText(json), costUsd: 0 };
+    })
+  );
+  const results = settled.map((s, i) =>
+    s.status === "fulfilled" ? s.value : { model: models[i], ok: false, latencyMs: 0 }
+  );
+
+  const usage = aggregateUsage(results);
+  const outcome = decideFusionOutcome(results);
+  log?.info?.("FUSION", `proposers ${usage.okCount}/${models.length} ok, path=${outcome.path}`);
+
+  // 2. All failed -> 503.
+  if (outcome.path === "all_failed") {
+    return unavailableResponse(503, "All fusion proposers unavailable");
+  }
+
+  // 3. Exactly one survivor -> passthrough (degraded), no judge call.
+  if (outcome.path === "single_passthrough") {
+    return handleSingleModel(body, outcome.winner.model);
+  }
+
+  // 4. Synthesize: build judge prompt, call judge with the client's stream pref.
+  const userPrompt = latestUserText(body);
+  const judgePrompt = buildJudgePrompt({
+    userPrompt,
+    proposals: outcome.survivors.map((s) => ({ model: s.model, text: s.text })),
+    instruction: config.judgePrompt,
+  });
+  const judgeBody = {
+    ...body,
+    stream: wantStream,
+    messages: [{ role: "user", content: judgePrompt }],
+    input: undefined,
+  };
+  const judgeRes = await handleSingleModel(judgeBody, judgeModel);
+
+  // 5. Judge failed -> fall back to best survivor's answer.
+  if (!judgeRes.ok) {
+    log?.warn?.("FUSION", "judge failed, falling back to first survivor");
+    return handleSingleModel(body, outcome.survivors[0].model);
+  }
+
+  // 6. Footer disabled -> return judge response as-is (already correct client format).
+  if (!config.showProvenanceFooter) {
+    return judgeRes;
+  }
+
+  // 7. Footer enabled: streaming stays a clean passthrough (streaming-footer injection
+  //    is a deferred enhancement); non-streaming gets the footer appended.
+  if (wantStream) {
+    return judgeRes;
+  }
+  const judgeJson = await judgeRes.clone().json().catch(() => null);
+  const footer = formatProvenanceFooter({
+    perModel: results.map((r) => ({ model: r.model, ok: r.ok })),
+    judgeModel,
+    degraded: usage.failCount > 0,
+  });
+  if (judgeJson?.choices?.[0]?.message && typeof judgeJson.choices[0].message.content === "string") {
+    judgeJson.choices[0].message.content += footer;
+  } else if (Array.isArray(judgeJson?.content)) {
+    judgeJson.content.push({ type: "text", text: footer });
+  }
+  return new Response(JSON.stringify(judgeJson), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
 }
