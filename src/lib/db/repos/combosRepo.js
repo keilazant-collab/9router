@@ -41,7 +41,7 @@ export async function createCombo(data) {
     name: data.name,
     kind: data.kind || null,
     models: data.models || [],
-    config: data.config || null,
+    config: data.config ?? null,
     createdAt: now,
     updatedAt: now,
   };
