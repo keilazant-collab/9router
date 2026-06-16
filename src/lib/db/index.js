@@ -143,8 +143,8 @@ export async function importDb(payload) {
     }
     for (const c of payload.combos || []) {
       db.run(
-        `INSERT OR REPLACE INTO combos(id, name, kind, models, createdAt, updatedAt) VALUES(?, ?, ?, ?, ?, ?)`,
-        [c.id, c.name, c.kind || null, stringifyJson(c.models || []), c.createdAt || new Date().toISOString(), c.updatedAt || new Date().toISOString()]
+        `INSERT OR REPLACE INTO combos(id, name, kind, models, config, createdAt, updatedAt) VALUES(?, ?, ?, ?, ?, ?, ?)`,
+        [c.id, c.name, c.kind || null, stringifyJson(c.models || []), stringifyJson(c.config ?? null), c.createdAt || new Date().toISOString(), c.updatedAt || new Date().toISOString()]
       );
     }
     for (const [a, m] of Object.entries(payload.modelAliases || {})) {
