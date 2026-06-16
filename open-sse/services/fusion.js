@@ -4,7 +4,7 @@
  * orchestrator handleFusionChat (added later) wires them to the request path.
  */
 
-import { unavailableResponse } from "../utils/error.js";
+import { errorResponse } from "../utils/error.js";
 
 export const DEFAULT_JUDGE_INSTRUCTION =
   "You are a synthesis judge. Below is a user prompt and several independent " +
@@ -154,9 +154,9 @@ export async function handleFusionChat({ body, models, config = {}, handleSingle
   const outcome = decideFusionOutcome(results);
   log?.info?.("FUSION", `proposers ${usage.okCount}/${models.length} ok, path=${outcome.path}`);
 
-  // 2. All failed -> 503.
+  // 2. All failed -> 503. (No meaningful retry-after for fusion, so use a plain error.)
   if (outcome.path === "all_failed") {
-    return unavailableResponse(503, "All fusion proposers unavailable");
+    return errorResponse(503, "All fusion proposers unavailable");
   }
 
   // 3. Exactly one survivor -> passthrough (degraded), no judge call.
@@ -171,11 +171,17 @@ export async function handleFusionChat({ body, models, config = {}, handleSingle
     proposals: outcome.survivors.map((s) => ({ model: s.model, text: s.text })),
     instruction: config.judgePrompt,
   });
+  // Normalize the judge turn to a single `messages` entry. Null out the other
+  // content carriers so a non-OpenAI/Claude inbound shape (Responses `input`,
+  // Gemini `contents`) can't leak the original prompt into the judge call.
+  // (Gemini-native inbound is a known v1 limitation; primary clients are
+  // OpenAI/Claude format.)
   const judgeBody = {
     ...body,
     stream: wantStream,
     messages: [{ role: "user", content: judgePrompt }],
     input: undefined,
+    contents: undefined,
   };
   const judgeRes = await handleSingleModel(judgeBody, judgeModel);
 
