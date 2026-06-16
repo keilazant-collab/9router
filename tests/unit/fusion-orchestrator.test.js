@@ -47,10 +47,9 @@ describe("handleFusionChat", () => {
     expect(json.choices[0].message.content).toBe("ONLY");
     // judge/m must never have been called
     expect(handle.calls.some((c) => c.model === "judge/m")).toBe(false);
-    // the final (passthrough) call uses the ORIGINAL messages, not a judge prompt
-    const last = handle.calls[handle.calls.length - 1];
-    expect(last.model).toBe("a/b");
-    expect(last.body.messages[0].content).toBe("Name three primary colors.");
+    // the survivor's buffered answer is reused - a/b is called once (proposer
+    // phase), NOT re-called for the passthrough.
+    expect(handle.calls.filter((c) => c.model === "a/b").length).toBe(1);
   });
 
   it("synthesizes via the judge when 2+ proposers succeed", async () => {

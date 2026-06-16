@@ -3,8 +3,11 @@ import {
   normalizeAnswer,
   detectConsensus,
   withTimeout,
+  settleProposers,
   handleFusionChat,
 } from "../../open-sse/services/fusion.js";
+
+const delay = (ms, v) => new Promise((r) => setTimeout(() => r(v), ms));
 
 const noopLog = { info() {}, warn() {}, error() {} };
 
@@ -13,6 +16,9 @@ function okResp(text) {
     JSON.stringify({ choices: [{ message: { role: "assistant", content: text } }] }),
     { status: 200, headers: { "Content-Type": "application/json" } }
   );
+}
+function failResp() {
+  return new Response(JSON.stringify({ error: "boom" }), { status: 500 });
 }
 function makeHandler(map) {
   const calls = [];
@@ -77,6 +83,34 @@ describe("withTimeout", () => {
   });
 });
 
+describe("settleProposers (first-success grace)", () => {
+  const onTimeout = (i) => ({ model: "m" + i, ok: false, timedOut: true });
+
+  it("waits for a slow success instead of cutting everything (no false all-fail)", async () => {
+    // Both slow; neither would survive a naive 10ms wall clock. Grace must not
+    // arm until the first ok, so both still land ok.
+    const out = await settleProposers([delay(40, { ok: true, text: "a" }), delay(50, { ok: true, text: "b" })], {
+      graceMs: 10, onTimeout,
+    });
+    expect(out.filter((r) => r.ok).length).toBe(2);
+  });
+
+  it("cuts a straggler once the first proposer succeeds", async () => {
+    const out = await settleProposers([delay(5, { ok: true, text: "fast" }), delay(500, { ok: true, text: "slow" })], {
+      graceMs: 20, onTimeout,
+    });
+    expect(out[0].ok).toBe(true);
+    expect(out[1].timedOut).toBe(true);
+  });
+
+  it("returns every result when graceMs<=0", async () => {
+    const out = await settleProposers([delay(5, { ok: true }), delay(15, { ok: false })], { graceMs: 0, onTimeout });
+    expect(out.length).toBe(2);
+    expect(out[0].ok).toBe(true);
+    expect(out[1].ok).toBe(false);
+  });
+});
+
 describe("handleFusionChat consensus + timeout", () => {
   it("skips the judge when proposers agree on a short answer", async () => {
     const handle = makeHandler({
@@ -117,6 +151,37 @@ describe("handleFusionChat consensus + timeout", () => {
     const json = await res.clone().json();
     expect(json.choices[0].message.content).toBe("SYNTHESIZED");
     expect(handle.calls.some((c) => c.model === "judge/m")).toBe(true);
+  });
+
+  it("reuses the buffered survivor response on single-passthrough (no re-call)", async () => {
+    const handle = makeHandler({ "a/b": () => okResp("ONLY"), "c/d": failResp(), "judge/m": okResp("X") });
+    const res = await handleFusionChat({
+      body: baseBody, models: ["a/b", "c/d"], config: { judgeModel: "judge/m" },
+      handleSingleModel: handle, log: noopLog,
+    });
+    const json = await res.clone().json();
+    expect(json.choices[0].message.content).toBe("ONLY");
+    // a/b is called exactly once (the proposer call) - NOT re-called for passthrough
+    expect(handle.calls.filter((c) => c.model === "a/b").length).toBe(1);
+  });
+
+  it("does NOT 503 when all proposers are slow but eventually succeed", async () => {
+    const slowOk = (text) => () => delay(40, okResp(text));
+    const handle = makeHandler({
+      "a/b": slowOk("first slow proposer answer here"),
+      "c/d": slowOk("second slow proposer answer here"),
+      "judge/m": okResp("SYNTHESIZED"),
+    });
+    const res = await handleFusionChat({
+      body: baseBody, models: ["a/b", "c/d"],
+      config: { judgeModel: "judge/m", proposerTimeoutMs: 5 }, // tiny grace, but both are slow
+      handleSingleModel: handle, log: noopLog,
+    });
+    expect(res.status).not.toBe(503);
+    const json = await res.clone().json();
+    // At least one slow proposer survived (no false all-fail), so we get a real
+    // answer - either the judge synthesis or, if a straggler was cut, a survivor.
+    expect((json.choices[0].message.content || "").length).toBeGreaterThan(0);
   });
 
   it("drops a hung proposer via proposerTimeoutMs and still synthesizes", async () => {

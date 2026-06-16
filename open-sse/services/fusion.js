@@ -14,7 +14,10 @@ export const DEFAULT_JUDGE_INSTRUCTION =
   "directly as if it were your own. Do NOT include any preamble, analysis, or " +
   "commentary about the candidate answers; do NOT mention models, candidates, " +
   "agreement, or conflict; do NOT prepend labels like 'Final Answer'. Obey any " +
-  "format, length, or style constraints in the user's prompt exactly.";
+  "format, length, or style constraints in the user's prompt exactly. If the " +
+  "prompt sets a measurable requirement (an exact word, line, or character " +
+  "count, or a specific structure), count and verify it yourself and fix the " +
+  "answer if it is off before you respond.";
 
 function labelFor(index) {
   return String.fromCharCode(65 + index); // 0 -> A, 1 -> B, ...
@@ -163,6 +166,42 @@ export function withTimeout(promise, ms, timeoutValue) {
   ]);
 }
 
+/**
+ * Settle proposer results with a "first-success grace" policy. A proposer is
+ * NEVER cut until at least one has SUCCEEDED, so a slow-but-working fan-out
+ * cannot fail just because every model was slow (the naive per-proposer wall
+ * clock could drop them all and force a 503). Once the first ok result lands,
+ * still-pending proposers get `graceMs` to finish before being cut to
+ * onTimeout(i). graceMs<=0 just waits for every proposer to settle.
+ * @param {Promise<any>[]} promises - resolve-only proposer promises (never reject)
+ * @param {{graceMs?:number, isOk?:(r:any)=>boolean, onTimeout:(i:number)=>any}} opts
+ * @returns {Promise<any[]>}
+ */
+export function settleProposers(promises, { graceMs = 0, isOk = (r) => r && r.ok, onTimeout } = {}) {
+  const list = Array.isArray(promises) ? promises : [];
+  return new Promise((resolve) => {
+    if (list.length === 0) return resolve([]);
+    const results = new Array(list.length);
+    let remaining = list.length;
+    let graceTimer = null;
+    const cutPending = () => {
+      for (let i = 0; i < list.length; i++) {
+        if (results[i] === undefined) results[i] = onTimeout ? onTimeout(i) : { ok: false, timedOut: true };
+      }
+      resolve(results);
+    };
+    list.forEach((p, i) => {
+      Promise.resolve(p).then((r) => {
+        if (results[i] !== undefined) return; // already cut by grace
+        results[i] = r;
+        remaining -= 1;
+        if (graceMs > 0 && !graceTimer && isOk(r)) graceTimer = setTimeout(cutPending, graceMs);
+        if (remaining === 0) { if (graceTimer) clearTimeout(graceTimer); resolve(results); }
+      });
+    });
+  });
+}
+
 const USER_PROMPT_FALLBACK = "(see conversation)";
 
 // Extract the latest user text from a request body across known shapes.
@@ -196,26 +235,28 @@ export async function handleFusionChat({ body, models, config = {}, handleSingle
   const wantStream = body?.stream === true;
   const judgeModel = config.judgeModel || models[0];
   const proposerTimeoutMs = Number(config.proposerTimeoutMs) || 0;
-  const TIMED_OUT = Symbol("timed_out");
 
-  // 1. Run proposers in parallel, buffered (stream:false). A per-proposer
-  //    timeout (when configured) drops a hung model so it can't stall the
-  //    fan-out; fusion already tolerates the resulting partial failure.
+  // 1. Run proposers in parallel, buffered (stream:false). The "first-success
+  //    grace" policy (settleProposers) drops a straggler only AFTER at least
+  //    one proposer has answered, so a slow-but-working fan-out never collapses
+  //    to a 503 just because every model was slow.
   const proposerBody = { ...body, stream: false };
-  const settled = await Promise.allSettled(
-    models.map(async (model) => {
-      const started = Date.now();
-      const res = await withTimeout(handleSingleModel(proposerBody, model), proposerTimeoutMs, TIMED_OUT);
+  const proposerPromises = models.map((model) => (async () => {
+    const started = Date.now();
+    try {
+      const res = await handleSingleModel(proposerBody, model);
       const latencyMs = Date.now() - started;
-      if (res === TIMED_OUT) return { model, ok: false, latencyMs, timedOut: true };
       if (!res.ok) return { model, ok: false, latencyMs, status: res.status };
       const json = await res.clone().json().catch(() => null);
       return { model, ok: true, latencyMs, text: extractAssistantText(json), costUsd: 0, response: res };
-    })
-  );
-  const results = settled.map((s, i) =>
-    s.status === "fulfilled" ? s.value : { model: models[i], ok: false, latencyMs: 0 }
-  );
+    } catch (e) {
+      return { model, ok: false, latencyMs: Date.now() - started, error: String(e?.message || e) };
+    }
+  })());
+  const results = await settleProposers(proposerPromises, {
+    graceMs: proposerTimeoutMs,
+    onTimeout: (i) => ({ model: models[i], ok: false, latencyMs: proposerTimeoutMs, timedOut: true }),
+  });
 
   const usage = aggregateUsage(results);
   const outcome = decideFusionOutcome(results);
@@ -226,8 +267,11 @@ export async function handleFusionChat({ body, models, config = {}, handleSingle
     return errorResponse(503, "All fusion proposers unavailable");
   }
 
-  // 3. Exactly one survivor -> passthrough (degraded), no judge call.
+  // 3. Exactly one survivor -> passthrough (degraded), no judge call. Reuse the
+  //    answer we already buffered instead of re-calling the model; only re-call
+  //    when the client wanted streaming (a buffered body can't be streamed).
   if (outcome.path === "single_passthrough") {
+    if (!wantStream && outcome.winner.response) return outcome.winner.response;
     return handleSingleModel(body, outcome.winner.model);
   }
 
@@ -280,9 +324,11 @@ export async function handleFusionChat({ body, models, config = {}, handleSingle
   };
   const judgeRes = await handleSingleModel(judgeBody, judgeModel);
 
-  // 5. Judge failed -> fall back to best survivor's answer.
+  // 5. Judge failed -> fall back to a survivor's answer (reuse the buffered one
+  //    rather than re-calling; re-call only for a streaming client).
   if (!judgeRes.ok) {
     log?.warn?.("FUSION", "judge failed, falling back to first survivor");
+    if (!wantStream && outcome.survivors[0].response) return outcome.survivors[0].response;
     return handleSingleModel(body, outcome.survivors[0].model);
   }
 
