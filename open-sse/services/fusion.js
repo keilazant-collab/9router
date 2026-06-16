@@ -46,3 +46,20 @@ export function extractAssistantText(body) {
   }
   return "";
 }
+
+/**
+ * @param {{model:string, ok:boolean, latencyMs?:number, costUsd?:number}[]} entries
+ */
+export function aggregateUsage(entries) {
+  const list = Array.isArray(entries) ? entries : [];
+  let totalLatencyMs = 0;
+  let totalCostUsd = 0;
+  let okCount = 0;
+  let failCount = 0;
+  for (const e of list) {
+    totalLatencyMs += Number(e.latencyMs) || 0;
+    totalCostUsd += Number(e.costUsd) || 0;
+    if (e.ok) okCount += 1; else failCount += 1;
+  }
+  return { totalLatencyMs, totalCostUsd, okCount, failCount, perModel: list };
+}
