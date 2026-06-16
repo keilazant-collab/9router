@@ -416,6 +416,10 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, kindF
   const [judgeModel, setJudgeModel] = useState(combo?.config?.judgeModel || "");
   const [judgePrompt, setJudgePrompt] = useState(combo?.config?.judgePrompt || "");
   const [showProvenanceFooter, setShowProvenanceFooter] = useState(combo?.config?.showProvenanceFooter ?? false);
+  const [consensusFastPath, setConsensusFastPath] = useState(combo?.config?.consensusFastPath ?? true);
+  const [proposerTimeoutSec, setProposerTimeoutSec] = useState(
+    combo?.config?.proposerTimeoutMs ? Math.round(combo.config.proposerTimeoutMs / 1000) : 0
+  );
   const [showModelSelect, setShowModelSelect] = useState(false);
   const [showJudgeModelSelect, setShowJudgeModelSelect] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -513,9 +517,12 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, kindF
       const config = {
         judgeModel: resolvedJudgeModel,
         showProvenanceFooter,
+        consensusFastPath,
       };
       const trimmedPrompt = judgePrompt.trim();
       if (trimmedPrompt) config.judgePrompt = trimmedPrompt;
+      const timeoutMs = Math.max(0, Math.round(Number(proposerTimeoutSec) || 0)) * 1000;
+      if (timeoutMs > 0) config.proposerTimeoutMs = timeoutMs;
       payload.config = config;
     } else {
       payload.config = null;
@@ -625,6 +632,38 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, kindF
                   <span className="text-sm font-medium text-text-main">Show provenance footer</span>
                   <span className="text-xs text-text-muted">Append a summary of which models ran + confidence to the answer.</span>
                 </div>
+              </div>
+
+              {/* Consensus fast-path */}
+              <div className="flex items-start gap-3">
+                <Toggle
+                  checked={consensusFastPath}
+                  onChange={setConsensusFastPath}
+                  size="sm"
+                />
+                <div className="flex flex-col">
+                  <span className="text-sm font-medium text-text-main">Consensus fast-path</span>
+                  <span className="text-xs text-text-muted">When proposers agree on a short answer, skip the judge and return it directly. Faster, same result.</span>
+                </div>
+              </div>
+
+              {/* Proposer timeout */}
+              <div>
+                <label className="text-sm font-medium mb-1.5 block">
+                  Proposer timeout
+                  <span className="ml-1 font-normal text-text-muted">(seconds, 0 = no limit)</span>
+                </label>
+                <input
+                  type="number"
+                  min={0}
+                  value={proposerTimeoutSec}
+                  onChange={(e) => setProposerTimeoutSec(e.target.value)}
+                  placeholder="0"
+                  className="w-full rounded-[10px] border border-transparent bg-surface-2 px-3 py-2.5 text-sm text-text-main placeholder-text-muted/70 focus:outline-none focus:ring-2 focus:ring-brand-500/30 focus:border-brand-500/40 transition-all duration-150"
+                />
+                <p className="text-[10px] text-text-muted mt-0.5">
+                  Drop a proposer that hangs past this many seconds; the judge synthesizes from the rest.
+                </p>
               </div>
             </div>
           )}

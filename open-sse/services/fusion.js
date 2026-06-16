@@ -8,10 +8,13 @@ import { errorResponse } from "../utils/error.js";
 
 export const DEFAULT_JUDGE_INSTRUCTION =
   "You are a synthesis judge. Below is a user prompt and several independent " +
-  "answers from different AI models. Identify where the answers agree, where " +
-  "they conflict, and any unique insight or blind spot. Then write ONE final, " +
-  "authoritative answer for the user. Do not mention that multiple models were " +
-  "used unless it materially helps. Resolve conflicts on the merits.";
+  "answers from different AI models. Silently compare them - weigh where they " +
+  "agree, conflict, or add unique insight - and resolve conflicts on the merits. " +
+  "Then output ONLY the single best final answer to the user's prompt, written " +
+  "directly as if it were your own. Do NOT include any preamble, analysis, or " +
+  "commentary about the candidate answers; do NOT mention models, candidates, " +
+  "agreement, or conflict; do NOT prepend labels like 'Final Answer'. Obey any " +
+  "format, length, or style constraints in the user's prompt exactly.";
 
 function labelFor(index) {
   return String.fromCharCode(65 + index); // 0 -> A, 1 -> B, ...
@@ -87,18 +90,77 @@ export function deriveConfidence({ okCount, failCount }) {
   return "low";
 }
 
-export function formatProvenanceFooter({ perModel, judgeModel, degraded }) {
+export function formatProvenanceFooter({ perModel, judgeModel, degraded, judgeSkipped }) {
   const okCount = perModel.filter((m) => m.ok).length;
   const failCount = perModel.length - okCount;
   const confidence = deriveConfidence({ okCount, failCount });
   const lines = perModel.map((m) => `- ${m.model}: ${m.ok ? "ok" : "failed"}`);
   const status = degraded ? " (degraded - some proposers failed)" : "";
+  const judgePart = judgeSkipped ? "judge skipped (consensus)" : `judge ${judgeModel}`;
   return [
     "",
     "---",
-    `Fusion: ${okCount}/${perModel.length} models, judge ${judgeModel}, confidence ${confidence}${status}`,
+    `Fusion: ${okCount}/${perModel.length} models, ${judgePart}, confidence ${confidence}${status}`,
     ...lines,
   ].join("\n");
+}
+
+/**
+ * Normalize a short answer for consensus comparison: drop code fences, markdown
+ * emphasis, surrounding quotes/brackets and trailing punctuation, collapse
+ * whitespace, lowercase. Two crisp answers like "$0.05" and "**$0.05**" compare
+ * equal; anything with prose stays distinct.
+ * @param {string} text
+ * @returns {string}
+ */
+export function normalizeAnswer(text) {
+  return String(text || "")
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/[*_`#>]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/^["'([\]]+|["')\].,!?:;]+$/g, "")
+    .trim()
+    .toLowerCase();
+}
+
+/**
+ * Detect unanimous short-answer consensus among proposer survivors. Fires only
+ * when every survivor normalizes to the SAME string and that string is short (a
+ * crisp factual/numeric answer) - in that case a judge would merely echo it, so
+ * synthesis adds nothing. Long, prose, or divergent answers return
+ * { consensus:false } and must go through the judge (quality preserved).
+ * @param {{ok:boolean,text?:string,response?:Response}[]} survivors
+ * @param {{maxLen?:number}} opts
+ * @returns {{consensus:false}|{consensus:true, winner:object, normalized:string}}
+ */
+export function detectConsensus(survivors, { maxLen = 80 } = {}) {
+  const list = (Array.isArray(survivors) ? survivors : []).filter((s) => s && s.ok);
+  if (list.length < 2) return { consensus: false };
+  const norms = list.map((s) => normalizeAnswer(s.text));
+  if (norms.some((n) => !n || n.length > maxLen)) return { consensus: false };
+  if (!norms.every((n) => n === norms[0])) return { consensus: false };
+  // Representative: longest raw text among the agreeing answers (keeps units/formatting).
+  const winner = list.reduce((a, b) => ((b.text || "").length > (a.text || "").length ? b : a));
+  return { consensus: true, winner, normalized: norms[0] };
+}
+
+/**
+ * Resolve `promise`, but if it takes longer than `ms`, resolve to `timeoutValue`
+ * instead. The underlying work is abandoned (not awaited), so one hung proposer
+ * cannot stall the whole fan-out. ms<=0 disables the timeout.
+ */
+export function withTimeout(promise, ms, timeoutValue) {
+  if (!ms || ms <= 0) return promise;
+  let timer;
+  const timeout = new Promise((resolve) => { timer = setTimeout(() => resolve(timeoutValue), ms); });
+  return Promise.race([
+    Promise.resolve(promise).then(
+      (v) => { clearTimeout(timer); return v; },
+      (e) => { clearTimeout(timer); throw e; },
+    ),
+    timeout,
+  ]);
 }
 
 const USER_PROMPT_FALLBACK = "(see conversation)";
@@ -133,17 +195,22 @@ function latestUserText(body) {
 export async function handleFusionChat({ body, models, config = {}, handleSingleModel, log }) {
   const wantStream = body?.stream === true;
   const judgeModel = config.judgeModel || models[0];
+  const proposerTimeoutMs = Number(config.proposerTimeoutMs) || 0;
+  const TIMED_OUT = Symbol("timed_out");
 
-  // 1. Run proposers in parallel, buffered (stream:false).
+  // 1. Run proposers in parallel, buffered (stream:false). A per-proposer
+  //    timeout (when configured) drops a hung model so it can't stall the
+  //    fan-out; fusion already tolerates the resulting partial failure.
   const proposerBody = { ...body, stream: false };
   const settled = await Promise.allSettled(
     models.map(async (model) => {
       const started = Date.now();
-      const res = await handleSingleModel(proposerBody, model);
+      const res = await withTimeout(handleSingleModel(proposerBody, model), proposerTimeoutMs, TIMED_OUT);
       const latencyMs = Date.now() - started;
+      if (res === TIMED_OUT) return { model, ok: false, latencyMs, timedOut: true };
       if (!res.ok) return { model, ok: false, latencyMs, status: res.status };
       const json = await res.clone().json().catch(() => null);
-      return { model, ok: true, latencyMs, text: extractAssistantText(json), costUsd: 0 };
+      return { model, ok: true, latencyMs, text: extractAssistantText(json), costUsd: 0, response: res };
     })
   );
   const results = settled.map((s, i) =>
@@ -162,6 +229,34 @@ export async function handleFusionChat({ body, models, config = {}, handleSingle
   // 3. Exactly one survivor -> passthrough (degraded), no judge call.
   if (outcome.path === "single_passthrough") {
     return handleSingleModel(body, outcome.winner.model);
+  }
+
+  // 3.5 Consensus fast-path: if every survivor already agrees on the same short
+  //     answer, the judge would only echo it - return the agreed answer and skip
+  //     the extra round-trip. Non-streaming only (a buffered proposer response
+  //     can't be cleanly re-emitted as SSE); streaming keeps the judge relay.
+  if (config.consensusFastPath !== false && !wantStream) {
+    const consensus = detectConsensus(outcome.survivors, { maxLen: Number(config.consensusMaxLen) || undefined });
+    if (consensus.consensus && consensus.winner.response) {
+      log?.info?.("FUSION", `consensus fast-path: judge skipped ("${consensus.normalized.slice(0, 40)}")`);
+      if (!config.showProvenanceFooter) return consensus.winner.response;
+      const cjson = await consensus.winner.response.clone().json().catch(() => null);
+      const footer = formatProvenanceFooter({
+        perModel: results.map((r) => ({ model: r.model, ok: r.ok })),
+        judgeModel,
+        degraded: usage.failCount > 0,
+        judgeSkipped: true,
+      });
+      if (cjson?.choices?.[0]?.message && typeof cjson.choices[0].message.content === "string") {
+        cjson.choices[0].message.content += footer;
+      } else if (Array.isArray(cjson?.content)) {
+        cjson.content.push({ type: "text", text: footer });
+      }
+      return new Response(JSON.stringify(cjson), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
   }
 
   // 4. Synthesize: build judge prompt, call judge with the client's stream pref.
