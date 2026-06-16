@@ -4,6 +4,9 @@ import {
   detectConsensus,
   withTimeout,
   settleProposers,
+  parseCountConstraint,
+  countUnit,
+  checkCountConstraint,
   handleFusionChat,
 } from "../../open-sse/services/fusion.js";
 
@@ -108,6 +111,45 @@ describe("settleProposers (first-success grace)", () => {
     expect(out.length).toBe(2);
     expect(out[0].ok).toBe(true);
     expect(out[1].ok).toBe(false);
+  });
+});
+
+describe("count constraints", () => {
+  it("parses exact / max / min word, sentence, line constraints", () => {
+    expect(parseCountConstraint("Write exactly 13 words.")).toEqual({ type: "words", n: 13, mode: "exact" });
+    expect(parseCountConstraint("Explain in under 120 words.")).toEqual({ type: "words", n: 120, mode: "max" });
+    expect(parseCountConstraint("Use at least 50 words.")).toEqual({ type: "words", n: 50, mode: "min" });
+    expect(parseCountConstraint("Write a 4-line poem.")).toEqual({ type: "lines", n: 4, mode: "exact" });
+    expect(parseCountConstraint("exactly 3 sentences please")).toEqual({ type: "sentences", n: 3, mode: "exact" });
+    expect(parseCountConstraint("just answer the question")).toBe(null);
+  });
+
+  it("counts words/lines/sentences and checks the constraint", () => {
+    expect(countUnit("one two three", "words")).toBe(3);
+    expect(countUnit("a.\nb.\nc.", "lines")).toBe(3);
+    expect(countUnit("Hi there. How are you? Fine!", "sentences")).toBe(3);
+    expect(checkCountConstraint("one two three", { type: "words", n: 3, mode: "exact" }).ok).toBe(true);
+    expect(checkCountConstraint("one two three four", { type: "words", n: 3, mode: "exact" })).toEqual({ ok: false, actual: 4 });
+    expect(checkCountConstraint("one two", { type: "words", n: 5, mode: "max" }).ok).toBe(true);
+  });
+
+  it("repairs an exact word-count miss via one judge re-ask", async () => {
+    const handle = async (_body, model) => {
+      if (model === "judge/m") {
+        if (/Rewrite it to meet/.test(_body.messages[0].content)) return okResp("one two three four five"); // 5 words
+        return okResp("one two three four five six seven"); // first pass: 7 words
+      }
+      return model === "a/b"
+        ? okResp("A reasonably long first proposer draft that avoids consensus entirely.")
+        : okResp("A clearly different second proposer draft, also long enough here.");
+    };
+    const res = await handleFusionChat({
+      body: { stream: false, messages: [{ role: "user", content: "Write a sentence of exactly 5 words." }] },
+      models: ["a/b", "c/d"], config: { judgeModel: "judge/m" },
+      handleSingleModel: handle, log: noopLog,
+    });
+    const json = await res.clone().json();
+    expect(countUnit(json.choices[0].message.content, "words")).toBe(5);
   });
 });
 

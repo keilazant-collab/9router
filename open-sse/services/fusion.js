@@ -202,6 +202,51 @@ export function settleProposers(promises, { graceMs = 0, isOk = (r) => r && r.ok
   });
 }
 
+/**
+ * Detect an explicit count constraint in the user prompt (words/sentences/lines,
+ * exact / max / min). Returns null when none is found. Conservative on purpose -
+ * only fires on clear phrasings so it never triggers a needless repair pass.
+ * @returns {{type:"words"|"sentences"|"lines", n:number, mode:"exact"|"max"|"min"}|null}
+ */
+export function parseCountConstraint(prompt) {
+  const p = String(prompt || "");
+  const units = "(words?|sentences?|lines?)";
+  const norm = (u) => (/^w/.test(u) ? "words" : /^s/.test(u) ? "sentences" : "lines");
+  let m;
+  // max / min phrasings first, so a generic "N words" match can't shadow them.
+  if ((m = p.match(new RegExp(`(?:under|at most|no more than|fewer than|less than|within)\\s+(\\d+)\\s+${units}`, "i")))) return { type: norm(m[2]), n: +m[1], mode: "max" };
+  if ((m = p.match(new RegExp(`(?:at least|no fewer than|minimum of)\\s+(\\d+)\\s+${units}`, "i")))) return { type: norm(m[2]), n: +m[1], mode: "min" };
+  if ((m = p.match(new RegExp(`(?:in\\s+)?exactly\\s+(\\d+)\\s+${units}`, "i")))) return { type: norm(m[2]), n: +m[1], mode: "exact" };
+  if ((m = p.match(new RegExp(`\\b(\\d+)-(words?|sentences?|lines?)\\b`, "i")))) return { type: norm(m[2]), n: +m[1], mode: "exact" };
+  return null;
+}
+
+export function countUnit(text, type) {
+  const t = String(text || "").trim();
+  if (!t) return 0;
+  if (type === "words") return t.split(/\s+/).filter(Boolean).length;
+  if (type === "lines") return t.split(/\n/).filter((l) => l.trim()).length;
+  // sentences: count terminal punctuation groups, fall back to 1 for a non-empty blob
+  const s = t.match(/[^.!?]+[.!?]+(?:["')\]]+)?/g);
+  return s ? s.length : 1;
+}
+
+/** @returns {{ok:boolean, actual:number}} */
+export function checkCountConstraint(text, constraint) {
+  if (!constraint) return { ok: true, actual: 0 };
+  const actual = countUnit(text, constraint.type);
+  const { n, mode } = constraint;
+  const ok = mode === "exact" ? actual === n : mode === "max" ? actual <= n : actual >= n;
+  return { ok, actual };
+}
+
+/** Write assistant text back into a parsed judge response (OpenAI or Claude shape). */
+export function setAssistantText(body, text) {
+  if (body?.choices?.[0]?.message) body.choices[0].message.content = text;
+  else if (Array.isArray(body?.content)) body.content = [{ type: "text", text }];
+  return body;
+}
+
 const USER_PROMPT_FALLBACK = "(see conversation)";
 
 // Extract the latest user text from a request body across known shapes.
@@ -332,27 +377,51 @@ export async function handleFusionChat({ body, models, config = {}, handleSingle
     return handleSingleModel(body, outcome.survivors[0].model);
   }
 
-  // 6. Footer disabled -> return judge response as-is (already correct client format).
-  if (!config.showProvenanceFooter) {
-    return judgeRes;
+  // 6. Streaming -> clean passthrough (constraint repair + footer are
+  //    non-streaming only; streaming-footer injection stays a deferred item).
+  if (wantStream) return judgeRes;
+  const judgeJson = await judgeRes.clone().json().catch(() => null);
+  if (!judgeJson) return judgeRes;
+  let modified = false;
+
+  // 7. Constraint repair: if the prompt sets an explicit word/sentence/line
+  //    count and the judge missed it, re-ask the judge once with the exact
+  //    miss. Counting is a known weak spot; an explicit nudge fixes most cases.
+  const constraint = parseCountConstraint(userPrompt);
+  if (constraint) {
+    const text = extractAssistantText(judgeJson);
+    const check = checkCountConstraint(text, constraint);
+    if (!check.ok) {
+      const want = constraint.mode === "exact" ? `exactly ${constraint.n}` : constraint.mode === "max" ? `at most ${constraint.n}` : `at least ${constraint.n}`;
+      const fixInstruction =
+        `The answer below has ${check.actual} ${constraint.type}, but the user requires ${want} ${constraint.type}. ` +
+        `Rewrite it to meet that requirement EXACTLY, preserving meaning and quality. Count carefully before responding. ` +
+        `Output ONLY the revised answer.\n\nAnswer:\n${text}`;
+      const fixRes = await handleSingleModel({ ...judgeBody, stream: false, messages: [{ role: "user", content: fixInstruction }] }, judgeModel);
+      if (fixRes.ok) {
+        const fixedText = extractAssistantText(await fixRes.clone().json().catch(() => null));
+        const recheck = checkCountConstraint(fixedText, constraint);
+        if (fixedText && (recheck.ok || Math.abs(recheck.actual - constraint.n) < Math.abs(check.actual - constraint.n))) {
+          setAssistantText(judgeJson, fixedText);
+          modified = true;
+          log?.info?.("FUSION", `constraint repair: ${constraint.type} ${check.actual}->${recheck.actual} (want ${want})`);
+        }
+      }
+    }
   }
 
-  // 7. Footer enabled: streaming stays a clean passthrough (streaming-footer injection
-  //    is a deferred enhancement); non-streaming gets the footer appended.
-  if (wantStream) {
-    return judgeRes;
+  // 8. Provenance footer (optional).
+  if (config.showProvenanceFooter) {
+    const footer = formatProvenanceFooter({
+      perModel: results.map((r) => ({ model: r.model, ok: r.ok })),
+      judgeModel,
+      degraded: usage.failCount > 0,
+    });
+    setAssistantText(judgeJson, extractAssistantText(judgeJson) + footer);
+    modified = true;
   }
-  const judgeJson = await judgeRes.clone().json().catch(() => null);
-  const footer = formatProvenanceFooter({
-    perModel: results.map((r) => ({ model: r.model, ok: r.ok })),
-    judgeModel,
-    degraded: usage.failCount > 0,
-  });
-  if (judgeJson?.choices?.[0]?.message && typeof judgeJson.choices[0].message.content === "string") {
-    judgeJson.choices[0].message.content += footer;
-  } else if (Array.isArray(judgeJson?.content)) {
-    judgeJson.content.push({ type: "text", text: footer });
-  }
+
+  if (!modified) return judgeRes;
   return new Response(JSON.stringify(judgeJson), {
     status: 200,
     headers: { "Content-Type": "application/json" },
