@@ -81,3 +81,9 @@ export async function getComboModels(modelStr) {
   }
   return null;
 }
+
+/** Returns the full combo (with kind + config) or null. Combo names never contain "/". */
+export async function getComboByNameResolved(modelStr) {
+  if (modelStr.includes("/")) return null;
+  return await getComboByName(modelStr);
+}
