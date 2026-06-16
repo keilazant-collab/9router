@@ -26,3 +26,23 @@ export function buildJudgePrompt({ userPrompt, proposals, instruction }) {
     .join("\n\n");
   return `${head}\n\n## User prompt\n${userPrompt}\n\n## Candidate answers\n${blocks}\n\n## Your synthesized answer`;
 }
+
+/**
+ * Pull assistant text from a non-streaming response body in either
+ * OpenAI chat-completions shape or Claude messages shape.
+ * @param {any} body
+ * @returns {string}
+ */
+export function extractAssistantText(body) {
+  if (!body || typeof body !== "object") return "";
+  const choice = Array.isArray(body.choices) ? body.choices[0] : null;
+  const msgContent = choice?.message?.content;
+  if (typeof msgContent === "string") return msgContent;
+  if (Array.isArray(msgContent)) {
+    return msgContent.map((p) => (typeof p === "string" ? p : p?.text || "")).join("");
+  }
+  if (Array.isArray(body.content)) {
+    return body.content.filter((b) => b?.type === "text").map((b) => b.text || "").join("");
+  }
+  return "";
+}
