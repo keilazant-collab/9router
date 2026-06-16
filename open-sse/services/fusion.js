@@ -74,3 +74,27 @@ export function decideFusionOutcome(results) {
   if (survivors.length === 1) return { path: "single_passthrough", winner: survivors[0] };
   return { path: "synthesize", survivors };
 }
+
+/**
+ * Coarse, honest confidence: all proposers succeeded -> "high";
+ * some failed but >=2 succeeded -> "medium"; single answer -> "low".
+ */
+export function deriveConfidence({ okCount, failCount }) {
+  if (okCount >= 2 && failCount === 0) return "high";
+  if (okCount >= 2) return "medium";
+  return "low";
+}
+
+export function formatProvenanceFooter({ perModel, judgeModel, degraded }) {
+  const okCount = perModel.filter((m) => m.ok).length;
+  const failCount = perModel.length - okCount;
+  const confidence = deriveConfidence({ okCount, failCount });
+  const lines = perModel.map((m) => `- ${m.model}: ${m.ok ? "ok" : "failed"}`);
+  const status = degraded ? " (degraded - some proposers failed)" : "";
+  return [
+    "",
+    "---",
+    `Fusion: ${okCount}/${perModel.length} models, judge ${judgeModel}, confidence ${confidence}${status}`,
+    ...lines,
+  ].join("\n");
+}
