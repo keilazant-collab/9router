@@ -420,6 +420,9 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, kindF
   const [proposerTimeoutSec, setProposerTimeoutSec] = useState(
     combo?.config?.proposerTimeoutMs ? Math.round(combo.config.proposerTimeoutMs / 1000) : 0
   );
+  const [escalateModels, setEscalateModels] = useState(
+    Array.isArray(combo?.config?.escalateModels) ? combo.config.escalateModels : []
+  );
   const [showModelSelect, setShowModelSelect] = useState(false);
   const [showJudgeModelSelect, setShowJudgeModelSelect] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -523,6 +526,8 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, kindF
       if (trimmedPrompt) config.judgePrompt = trimmedPrompt;
       const timeoutMs = Math.max(0, Math.round(Number(proposerTimeoutSec) || 0)) * 1000;
       if (timeoutMs > 0) config.proposerTimeoutMs = timeoutMs;
+      const deep = escalateModels.filter((m) => models.includes(m));
+      if (deep.length) config.escalateModels = deep;
       payload.config = config;
     } else {
       payload.config = null;
@@ -665,6 +670,35 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, kindF
                   Drop a proposer that hangs past this many seconds; the judge synthesizes from the rest.
                 </p>
               </div>
+
+              {/* Deep models (escalation tier) */}
+              {models.length > 0 && (
+                <div>
+                  <label className="text-sm font-medium mb-1.5 block">
+                    Deep models
+                    <span className="ml-1 font-normal text-text-muted">- escalation tier (optional)</span>
+                  </label>
+                  <div className="flex flex-col gap-1">
+                    {models.map((m) => (
+                      <label key={m} className="flex items-center gap-2 text-xs text-text-main cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={escalateModels.includes(m)}
+                          onChange={(e) =>
+                            setEscalateModels((prev) =>
+                              e.target.checked ? [...new Set([...prev, m])] : prev.filter((x) => x !== m)
+                            )
+                          }
+                        />
+                        <code className="font-mono">{m}</code>
+                      </label>
+                    ))}
+                  </div>
+                  <p className="text-[10px] text-text-muted mt-0.5">
+                    Checked models run only as a 2nd phase, when the fast models disagree. Keep at least 2 fast (unchecked) models so they can reach consensus and skip the slow ones.
+                  </p>
+                </div>
+              )}
             </div>
           )}
 
