@@ -285,12 +285,16 @@ export async function handleFusionChat({ body, models, config = {}, handleSingle
   // first-success grace policy: a straggler is dropped only AFTER one proposer
   // has answered, so a slow-but-working fan-out never collapses to a 503.
   const proposerBody = { ...body, stream: false };
-  const runProposers = (modelList) =>
-    settleProposers(
+  const runProposers = (modelList, { maxTokens = 0 } = {}) => {
+    // Fast-tier proposers are drafts for the judge / consensus checks - capping
+    // their output makes them finish sooner without touching frontier quality,
+    // because the deep tier (and the judge) stay uncapped.
+    const phaseBody = maxTokens > 0 ? { ...proposerBody, max_tokens: maxTokens } : proposerBody;
+    return settleProposers(
       modelList.map((model) => (async () => {
         const started = Date.now();
         try {
-          const res = await handleSingleModel(proposerBody, model);
+          const res = await handleSingleModel(phaseBody, model);
           const latencyMs = Date.now() - started;
           if (!res.ok) return { model, ok: false, latencyMs, status: res.status };
           const json = await res.clone().json().catch(() => null);
@@ -301,6 +305,7 @@ export async function handleFusionChat({ body, models, config = {}, handleSingle
       })()),
       { graceMs: proposerTimeoutMs, onTimeout: (i) => ({ model: modelList[i], ok: false, latencyMs: proposerTimeoutMs, timedOut: true }) },
     );
+  };
 
   // 1. Tiered fan-out: defer the slow/deep models in `escalateModels` to a
   //    second phase. Run the fast tier first; only escalate (run the deep
@@ -313,7 +318,7 @@ export async function handleFusionChat({ body, models, config = {}, handleSingle
   if (deepModels.length === 0 || fastModels.length === 0) {
     results = await runProposers(models); // no usable tiering -> single phase (current behavior)
   } else {
-    results = await runProposers(fastModels);
+    results = await runProposers(fastModels, { maxTokens: Number(config.fastTierMaxTokens) || 0 });
     const fastSurvivors = results.filter((r) => r.ok);
     const fastConsensus = !wantStream && config.consensusFastPath !== false
       && detectConsensus(fastSurvivors, { maxLen: Number(config.consensusMaxLen) || undefined }).consensus;

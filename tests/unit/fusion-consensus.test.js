@@ -191,6 +191,24 @@ describe("handleFusionChat escalation (tiered fan-out)", () => {
     expect(judgeCall.body.messages[0].content).toContain("deep model reasoning");
   });
 
+  it("caps fast-tier proposer tokens but leaves the deep tier uncapped", async () => {
+    const handle = makeHandler({
+      "fast/1": okResp("alpha distinct fast-tier draft answer that avoids consensus"),
+      "fast/2": okResp("beta different fast-tier draft answer, long enough too"),
+      "deep/slow": okResp("deep answer"),
+      "judge/m": okResp("SYNTHESIZED"),
+    });
+    await handleFusionChat({
+      body: baseBody, models: ["fast/1", "fast/2", "deep/slow"],
+      config: { judgeModel: "judge/m", escalateModels: ["deep/slow"], fastTierMaxTokens: 256 },
+      handleSingleModel: handle, log: noopLog,
+    });
+    const fastCall = handle.calls.find((c) => c.model === "fast/1");
+    const deepCall = handle.calls.find((c) => c.model === "deep/slow");
+    expect(fastCall.body.max_tokens).toBe(256);
+    expect(deepCall.body.max_tokens).toBeUndefined();
+  });
+
   it("runs all models in one phase when escalateModels is empty (no regression)", async () => {
     const handle = makeHandler({
       "a/b": okResp("alpha long answer that avoids any consensus here please"),
