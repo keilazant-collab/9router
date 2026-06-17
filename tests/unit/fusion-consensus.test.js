@@ -153,6 +153,61 @@ describe("count constraints", () => {
   });
 });
 
+describe("handleFusionChat escalation (tiered fan-out)", () => {
+  it("skips deep models when the fast tier reaches consensus", async () => {
+    const handle = makeHandler({
+      "fast/1": okResp("42"),
+      "fast/2": okResp("42"),
+      "deep/slow": okResp("DEEP-SHOULD-NOT-RUN"),
+      "judge/m": okResp("JUDGE-SHOULD-NOT-RUN"),
+    });
+    const res = await handleFusionChat({
+      body: baseBody, models: ["fast/1", "fast/2", "deep/slow"],
+      config: { judgeModel: "judge/m", escalateModels: ["deep/slow"] },
+      handleSingleModel: handle, log: noopLog,
+    });
+    const json = await res.clone().json();
+    expect(json.choices[0].message.content).toContain("42");
+    expect(handle.calls.some((c) => c.model === "deep/slow")).toBe(false);
+    expect(handle.calls.some((c) => c.model === "judge/m")).toBe(false);
+  });
+
+  it("escalates to deep models when the fast tier disagrees", async () => {
+    const handle = makeHandler({
+      "fast/1": okResp("Paris is the capital of France, a major European city."),
+      "fast/2": okResp("The capital of France is Paris, known around the world."),
+      "deep/slow": okResp("deep model reasoning answer goes here"),
+      "judge/m": okResp("SYNTHESIZED"),
+    });
+    const res = await handleFusionChat({
+      body: baseBody, models: ["fast/1", "fast/2", "deep/slow"],
+      config: { judgeModel: "judge/m", escalateModels: ["deep/slow"] },
+      handleSingleModel: handle, log: noopLog,
+    });
+    const json = await res.clone().json();
+    expect(json.choices[0].message.content).toBe("SYNTHESIZED");
+    expect(handle.calls.some((c) => c.model === "deep/slow")).toBe(true);
+    const judgeCall = handle.calls.find((c) => c.model === "judge/m");
+    expect(judgeCall.body.messages[0].content).toContain("deep model reasoning");
+  });
+
+  it("runs all models in one phase when escalateModels is empty (no regression)", async () => {
+    const handle = makeHandler({
+      "a/b": okResp("alpha long answer that avoids any consensus here please"),
+      "c/d": okResp("beta clearly different answer, also long enough to avoid it"),
+      "judge/m": okResp("SYNTHESIZED"),
+    });
+    const res = await handleFusionChat({
+      body: baseBody, models: ["a/b", "c/d"], config: { judgeModel: "judge/m" },
+      handleSingleModel: handle, log: noopLog,
+    });
+    const json = await res.clone().json();
+    expect(json.choices[0].message.content).toBe("SYNTHESIZED");
+    expect(handle.calls.some((c) => c.model === "a/b")).toBe(true);
+    expect(handle.calls.some((c) => c.model === "c/d")).toBe(true);
+  });
+});
+
 describe("handleFusionChat consensus + timeout", () => {
   it("skips the judge when proposers agree on a short answer", async () => {
     const handle = makeHandler({

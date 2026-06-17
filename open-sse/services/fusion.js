@@ -281,31 +281,53 @@ export async function handleFusionChat({ body, models, config = {}, handleSingle
   const judgeModel = config.judgeModel || models[0];
   const proposerTimeoutMs = Number(config.proposerTimeoutMs) || 0;
 
-  // 1. Run proposers in parallel, buffered (stream:false). The "first-success
-  //    grace" policy (settleProposers) drops a straggler only AFTER at least
-  //    one proposer has answered, so a slow-but-working fan-out never collapses
-  //    to a 503 just because every model was slow.
+  // Run a set of proposers in parallel (buffered, stream:false) under the
+  // first-success grace policy: a straggler is dropped only AFTER one proposer
+  // has answered, so a slow-but-working fan-out never collapses to a 503.
   const proposerBody = { ...body, stream: false };
-  const proposerPromises = models.map((model) => (async () => {
-    const started = Date.now();
-    try {
-      const res = await handleSingleModel(proposerBody, model);
-      const latencyMs = Date.now() - started;
-      if (!res.ok) return { model, ok: false, latencyMs, status: res.status };
-      const json = await res.clone().json().catch(() => null);
-      return { model, ok: true, latencyMs, text: extractAssistantText(json), costUsd: 0, response: res };
-    } catch (e) {
-      return { model, ok: false, latencyMs: Date.now() - started, error: String(e?.message || e) };
+  const runProposers = (modelList) =>
+    settleProposers(
+      modelList.map((model) => (async () => {
+        const started = Date.now();
+        try {
+          const res = await handleSingleModel(proposerBody, model);
+          const latencyMs = Date.now() - started;
+          if (!res.ok) return { model, ok: false, latencyMs, status: res.status };
+          const json = await res.clone().json().catch(() => null);
+          return { model, ok: true, latencyMs, text: extractAssistantText(json), costUsd: 0, response: res };
+        } catch (e) {
+          return { model, ok: false, latencyMs: Date.now() - started, error: String(e?.message || e) };
+        }
+      })()),
+      { graceMs: proposerTimeoutMs, onTimeout: (i) => ({ model: modelList[i], ok: false, latencyMs: proposerTimeoutMs, timedOut: true }) },
+    );
+
+  // 1. Tiered fan-out: defer the slow/deep models in `escalateModels` to a
+  //    second phase. Run the fast tier first; only escalate (run the deep
+  //    models) when the fast tier doesn't already agree, so easy questions
+  //    never pay the deep reasoner's wall-clock.
+  const escalateSet = new Set(Array.isArray(config.escalateModels) ? config.escalateModels : []);
+  const deepModels = models.filter((m) => escalateSet.has(m));
+  const fastModels = models.filter((m) => !escalateSet.has(m));
+  let results;
+  if (deepModels.length === 0 || fastModels.length === 0) {
+    results = await runProposers(models); // no usable tiering -> single phase (current behavior)
+  } else {
+    results = await runProposers(fastModels);
+    const fastSurvivors = results.filter((r) => r.ok);
+    const fastConsensus = !wantStream && config.consensusFastPath !== false
+      && detectConsensus(fastSurvivors, { maxLen: Number(config.consensusMaxLen) || undefined }).consensus;
+    if (fastConsensus) {
+      log?.info?.("FUSION", `fast-tier consensus: escalation skipped (${deepModels.join(",")} not run)`);
+    } else {
+      log?.info?.("FUSION", `escalating to ${deepModels.join(",")} (fast tier ${fastSurvivors.length} ok)`);
+      results = results.concat(await runProposers(deepModels));
     }
-  })());
-  const results = await settleProposers(proposerPromises, {
-    graceMs: proposerTimeoutMs,
-    onTimeout: (i) => ({ model: models[i], ok: false, latencyMs: proposerTimeoutMs, timedOut: true }),
-  });
+  }
 
   const usage = aggregateUsage(results);
   const outcome = decideFusionOutcome(results);
-  log?.info?.("FUSION", `proposers ${usage.okCount}/${models.length} ok, path=${outcome.path}`);
+  log?.info?.("FUSION", `proposers ${usage.okCount}/${results.length} ok, path=${outcome.path}`);
 
   // 2. All failed -> 503. (No meaningful retry-after for fusion, so use a plain error.)
   if (outcome.path === "all_failed") {
